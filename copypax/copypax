@@ -1,0 +1,540 @@
+/* REXX ***************************************************************/
+/*    Procedure: COPYPAX - Version 2.3                                */
+/*  Description: COPY (clone) a file system structure using "pax"     */
+/*               Property of IBM  (C) Copyright IBM Corp. 2002-2011   */
+/*               Robert Hering (robert.hering@de.ibm.com)             */
+/*    Format is: copypax <time_out> source_dir target_dir             */
+/**********************************************************************/
+
+Trace O
+Parse Source . . myname .
+no_args = Words(Arg(1))
+Select
+  When no_args=2 Then Do
+    Parse Arg source_dir target_dir .
+    timeout_value = "R0"
+  End
+  When no_args=3 Then Parse Arg timeout_value source_dir target_dir .
+  Otherwise Do
+    Say "CPPAX001E Syntax:" myname "< time_out > source_dir target_dir"
+    Exit 8
+  End
+End /* Select */
+
+If timeout_value="" Then timeout_value = "R0"
+If Translate(Left(timeout_value,1))="R" Then
+  timeout_value = Substr(timeout_value,2)
+If timeout_value="" Then timeout_value = 0
+If Verify(timeout_value,"1234567890")<>0 Then Do
+  Say "CPPAX002E The timeout value specified is invalid."
+  Exit 8
+End
+
+If Syscalls("ON")>4 Then Do
+  Say "CPPAX003E The SYSCALL environment could not be established."
+  Exit 8
+End
+
+If Syscalls("SIGON")<>0 Then Do
+  Say "CPPAX004E The SIGNAL interface could not be established."
+  Exit 8
+End
+
+swsu = 1        /* always try to switch to superuser mode          */
+do_wait = 0     /* generally use the new interface, independent of */
+not_do_wait = 1 /* specifying Rxxxx or xxxx as timeout value       */
+sig_enabled = 0
+switched = 0
+final_rc = 0
+no_msgs = 1
+noexit_on_error = 1
+info_on_timeout = 2
+fd. = -1
+pp. = -1
+foreground = (Sysvar("SYSENV")="FORE")
+background = (foreground=0)
+Signal On Novalue Name Novalue_Error
+
+/* ------------------------------------------------------------------ */
+/*  Read and process COPYPAX parameters from CPPXPARM DD name         */
+/* ------------------------------------------------------------------ */
+
+Call Bpxwdyn "INFO DD(CPPXPARM)"
+If Pos(Left(Right(D2x(result),8,"0"),4),"0438 0440")<>0 Then Do
+  /* IKJ56247I FILE INFO-RETRIEVAL NOT PERFORMED, NOT ALLOCATED */
+  cppxvar.0 = 0
+End
+Else Do
+  "EXECIO * DISKR CPPXPARM (STEM CPPXVAR. FINIS"
+  If rc<>0 Then Do
+    Say  "CPPAX005E Error on reading COPYPAX variables from CPPXPARM",
+      "DD name, Rc="||rc
+    Call Final_Exit 8
+  End
+End
+
+   process_info_msgs = 1 /* display batch main process information    */
+target_must_be_empty = 1 /* Target structure must be empty            */
+correct_inv_fd_files = 1 /* Correct invalid fd files                  */
+    copy_pax_verbose = 0 /* List all objects copied                   */
+   no_file_overwrite = 0 /* Prevent overwriting of existing files     */
+
+invalid_cppxvar = 0
+Do i=1 To cppxvar.0
+  cppxvar_line = Translate(Strip(cppxvar.i))
+  If cppxvar_line="" | Left(cppxvar_line,1)="#" Then Iterate i
+  pos_equal = Pos("=",cppxvar_line)
+  If pos_equal=0 Then Iterate i
+  Select
+    When Left(cppxvar_line,pos_equal-1)="PROCESS_INFO_MSGS" Then Do
+      Parse Value Substr(cppxvar_line,pos_equal+1) With opt_test .
+      Select
+        When opt_test="Y" Then process_info_msgs = 1
+        When opt_test="N" Then process_info_msgs = 0
+        Otherwise Do
+          Say "The value specified for PROCESS_INFO_MSGS is invalid:"
+          Say "CPPXPARM line" Right(i,2)||":" cppxvar.i
+          invalid_cppxvar = 1
+        End
+      End
+    End
+    When Left(cppxvar_line,pos_equal-1)="TARGET_MUST_BE_EMPTY" Then Do
+      Parse Value Substr(cppxvar_line,pos_equal+1) With opt_test .
+      Select
+        When opt_test="Y" Then target_must_be_empty = 1
+        When opt_test="N" Then target_must_be_empty = 0
+        Otherwise Do
+          Say "The value specified for TARGET_MUST_BE_EMPTY is invalid."
+          Say "CPPXPARM line" Right(i,2)||":" cppxvar.i
+          invalid_cppxvar = 1
+        End
+      End
+    End
+    When Left(cppxvar_line,pos_equal-1)="CORRECT_INV_FD_FILES" Then Do
+      Parse Value Substr(cppxvar_line,pos_equal+1) With opt_test .
+      Select
+        When opt_test="Y" Then correct_inv_fd_files = 1
+        When opt_test="N" Then correct_inv_fd_files = 0
+        Otherwise Do
+          Say "The value specified for CORRECT_INV_FD_FILES is invalid."
+          Say "CPPXPARM line" Right(i,2)||":" cppxvar.i
+          invalid_cppxvar = 1
+        End
+      End
+    End
+    When Left(cppxvar_line,pos_equal-1)="COPY_PAX_VERBOSE" Then Do
+      Parse Value Substr(cppxvar_line,pos_equal+1) With opt_test .
+      Select
+        When opt_test="Y" Then copy_pax_verbose = 1
+        When opt_test="N" Then copy_pax_verbose = 0
+        Otherwise Do
+          Say "The value specified for COPY_PAX_VERBOSE is invalid."
+          Say "CPPXPARM line" Right(i,2)||":" cppxvar.i
+          invalid_cppxvar = 1
+        End
+      End
+    End
+    When Left(cppxvar_line,pos_equal-1)="NO_FILE_OVERWRITE" Then Do
+      Parse Value Substr(cppxvar_line,pos_equal+1) With opt_test .
+      Select
+        When opt_test="Y" Then no_file_overwrite = 1
+        When opt_test="N" Then no_file_overwrite = 0
+        Otherwise Do
+          Say "The value specified for COPY_PAX_VERBOSE is invalid."
+          Say "CPPXPARM line" Right(i,2)||":" cppxvar.i
+          invalid_cppxvar = 1
+        End
+      End
+    End
+    Otherwise Do
+      Say "An unknown COPYPAX parameter has been specified."
+      Say "CPPXPARM line" Right(i,2)||":" cppxvar.i
+      invalid_cppxvar = 1
+    End
+  End /* Select */
+End i
+If invalid_cppxvar Then Do
+  Say "CPPAX006E An invalid COPYPAX parameter has been found in the",
+    "CPPXPARM data specification."
+  Call Final_Exit 8
+End
+
+/* ------------------------------------------------------------------ */
+/*  Start processing                                                  */
+/* ------------------------------------------------------------------ */
+
+Call Syscall_Cmd "getpid"
+mainprocess_pid = retval
+If background & process_info_msgs Then Do
+  dash_line = Copies("----",19)
+  Say dash_line
+  Say "The main process ID for this job is" mainprocess_pid||".",
+    "If you should need to stop"
+  If do_wait Then signal_cmd = "kill -s ALRM"
+  Else signal_cmd = "kill" /* "-s TERM" is the default */
+  Say "processing use the following UNIX command in authorized mode to",
+    "do this:"
+  Say signal_cmd mainprocess_pid
+  Say dash_line
+  Say ""
+End
+
+/* ------------------------------------------------------------------ */
+/*  Switch effective and real UID to zero if needed and possible      */
+/* ------------------------------------------------------------------ */
+
+If swsu Then Do
+  If background Then Do
+    Call Syscall_Cmd "getuid"
+    cur_uid = retval
+    If cur_uid<>0 Then
+      Call Syscall_Cmd "setuid 0", noexit_on_error, no_msgs
+  End
+  Else Do /* foreground */
+    Call Syscall_Cmd "geteuid"
+    cur_euid = retval
+    Call Syscall_Cmd "getuid"
+    cur_uid = retval
+    If cur_euid<>0 | cur_uid<>0 Then Do
+      Call Syscall_Cmd "setreuid 0 0", noexit_on_error, no_msgs
+      If OK Then Do
+        Say "UID setting switched to 0..."
+        switched = 1
+      End
+    End
+  End
+End
+
+/* ------------------------------------------------------------------ */
+/*  Test whether source and target structure are in different devices */
+/* ------------------------------------------------------------------ */
+Say Time()||": Verifying existence of source directory" source_dir||,
+  "..."
+Call Syscall_Cmd "stat (source_dir) sst."
+If sst.st_type<>s_isdir Then Do
+  Say "CPPAX007E The source specification does not resolve to be a",
+    "directory."
+  Call Final_Exit 8
+End
+Say Time()||": Verifying existence of target directory" target_dir||,
+  "..."
+Call Syscall_Cmd "stat (target_dir) tst."
+If tst.st_type<>s_isdir Then Do
+  Say "CPPAX008E The target specification does not resolve to be a",
+    "directory."
+  Call Final_Exit 8
+End
+If sst.st_dev=tst.st_dev Then Do
+  Say "CPPAX009E Source and target structure cannot be located in the",
+    "same device."
+  Call Final_Exit 8
+End
+
+/* ------------------------------------------------------------------ */
+/*  Test whether target_dir is empty if requested                     */
+/* ------------------------------------------------------------------ */
+If target_must_be_empty Then Do
+  target_not_empty = 0
+  Call Syscall_Cmd "opendir (target_dir)"
+  targ_fd = retval
+  Call Syscall_Cmd "rddir (targ_fd) uss_data 4096"
+  trg_entries = retval
+  Select
+    When trg_entries>3 Then target_not_empty = 1
+    When trg_entries=3 Then Do
+      target_not_empty = 1
+      Do i=1 To 3
+        len_entry = C2d(Left(uss_data,2))
+        uss_data = Substr(uss_data,len_entry+1)
+        If len_entry=4 Then target_not_empty = 0
+      End
+    End
+    Otherwise Nop
+  End
+  Call Syscall_Cmd "closedir (targ_fd)"
+  If target_not_empty Then Do
+    Say "CPPAX010E The target directory structure is not empty, but",
+      "this is requested."
+    Call Final_Exit 8
+  End
+End
+
+/* ------------------------------------------------------------------ */
+/*  Set home and working directory, setup envvars, open /dev/null     */
+/* ------------------------------------------------------------------ */
+
+If swsu Then Do
+  Call Syscall_Cmd "getcwd cur_cwd"
+  home = "/"
+  Call Syscall_Cmd "chdir" home
+End
+Else Do
+  Call Syscall_Cmd "getpwnam" Userid() "omvs."
+  home = omvs.pw_dir
+End
+Call Syscall_Cmd "chdir" source_dir
+__environment.1 = "_BPX_SHAREAS=YES"
+__environment.2 = "PATH=/bin"
+__environment.3 = "HOME="||home
+__environment.4 = "LOGNAME="||Userid()
+__environment.5 = "PWD="||home
+envvars = 5
+Call Bpxwdyn "INFO DD(STDENV)"
+If Pos(Left(Right(D2x(result),8,"0"),4),"0438 0440")<>0 Then Do
+  /* IKJ56247I FILE INFO-RETRIEVAL NOT PERFORMED, NOT ALLOCATED */
+  envvar.0 = 0
+End
+Else Do
+  "EXECIO * DISKR STDENV (STEM ENVVAR. FINIS"
+  If rc<>0 Then Do
+    Say  "CPPAX011E Error on reading environment variables from STDENV",
+      "DD name, Rc="||rc
+    Call Final_Exit 8
+  End
+End
+Do i=1 To envvar.0
+  envvar_line = Strip(envvar.i)
+  envvars = envvars+1
+  __environment.envvars = envvar_line
+End
+__environment.0 = envvars
+Call Syscall_Cmd "open /dev/null (o_rdonly)"
+fd.0 = retval
+
+/* ------------------------------------------------------------------ */
+/*  Enable for timer interrupts                                       */
+/* ------------------------------------------------------------------ */
+
+Call Syscall_Cmd "sigaction" sigalrm sig_cat 0 "ohdl oflg"
+sig_enabled = 1
+Call Syscall_Cmd "sigprocmask" sig_unblock,
+  Sigaddset(Sigsetempty(),sigalrm) "mask"
+If not_do_wait Then
+  Call Syscall_Cmd "sigaction" sigterm sig_cat 0 "xhdl xflg"
+
+/* ------------------------------------------------------------------ */
+/*  Running pax in copy mode                                          */
+/* ------------------------------------------------------------------ */
+
+copy_msg = "Copying the source to the target structure using pax"
+pax_cmd_start = "pax -rw"
+If no_file_overwrite Then Do
+  copy_msg = copy_msg "and do not overwrite existing files"
+  pax_cmd_start = pax_cmd_start||"k"
+End
+If copy_pax_verbose Then Do
+  copy_msg = copy_msg "and listing all entries copied..."
+  pax_cmd_start = pax_cmd_start||"v"
+End
+Else copy_msg = copy_msg||"..."
+Say Time()||":" copy_msg
+Call Shell_Cmd pax_cmd_start "-peW -XCM ." target_dir
+If shell_rc<>0 Then Do
+  Say "CPPAX012E The pax command ended with return code",
+    "Rc("||shell_rc||")."
+  Call Final_Exit 8
+End
+
+/* ------------------------------------------------------------------ */
+/*  Running find command for csfs and correct fdfs if needed          */
+/* ------------------------------------------------------------------ */
+
+If correct_inv_fd_files Then Do
+  Say Time()||": Searching for and correcting invalid target file",
+    "descriptor entries..."
+  fd_files = 0
+  Call Shell_Cmd "find . -type c -xdev"
+  fdfile.0 = fd_files
+
+  If shell_rc<>0 Then Do
+    Say "CPPAX013E The find command ended with return code",
+      "Rc("||shell_rc||")."
+    Say "Begin of output provided by find command..."
+    Do i=1 To fdfile.0
+      Say fdfile.i
+    End
+    Say "End of output provided by find command..."
+    Call Final_Exit 8
+  End
+
+  corrected = 0
+  Do i=1 To fdfile.0
+    source_csf = fdfile.i
+    Call Syscall_Cmd "stat (source_csf) sst."
+    If sst.st_major=5 & sst.st_minor>255 Then Do
+      target_csf = Strip(target_dir,"T","/")||Substr(source_csf,2)
+      Call Syscall_Cmd "stat (target_csf) tst."
+      If tst.st_minor<>sst.st_minor Then Do
+        Call Syscall_Cmd "unlink (target_csf)"
+        Call Syscall_Cmd "mknod (target_csf)" sst.st_mode 5 sst.st_minor
+        corrected = corrected+1
+      End
+    End
+  End
+  If corrected<>0 Then
+    Say Time()||": Corrected" corrected "file descriptor entries..."
+End
+
+/* ------------------------------------------------------------------ */
+/*  End of processing                                                 */
+/* ------------------------------------------------------------------ */
+
+Call Final_Exit final_rc
+Exit 9999
+
+/* ------------------------------------------------------------------ */
+/*  Subroutines                                                       */
+/* ------------------------------------------------------------------ */
+
+Final_Exit: Trace O
+  Parse Arg final_rc
+  Say Time()||": Processing is ending..."
+  If swsu & Symbol("cur_cwd")="VAR" Then
+    Call Syscall_Cmd "chdir" cur_cwd
+  If sig_enabled Then
+    Call Syscall_Cmd "sigaction" sigalrm ohdl oflg "x y",,
+      noexit_on_error
+  Call Syscalls "SIGOFF"
+  Do i=0 To 2
+    If fd.i<>-1 Then Call Syscall_Cmd "close (fd.i)", noexit_on_error
+  End
+  If pp.1<>-1 Then Call Syscall_Cmd "close (pp.1)", noexit_on_error
+  If swsu & switched & foreground Then Do
+    Call Syscall_Cmd "setreuid" cur_uid cur_euid, noexit_on_error
+    If not_OK Then Say "UID settings could not be switched back..."
+  End
+  Call Syscalls "OFF"
+Exit final_rc
+
+Novalue_Error: Trace O
+  Say "CPPAX014W REXX error in sourceline" sigl "of" myname
+  Say "CPPAX015I Line" sigl||":" Strip(Sourceline(sigl))
+  Say "CPPAX016E Variable not initialized..."
+  Call Final_Exit 12
+Exit 9999
+
+Shell_Cmd: Trace O
+  Parse Arg shell_cmd
+  parm.0 = Words(shell_cmd)
+  Do i=1 To parm.0
+    parm.i = Word(shell_cmd,i)
+  End
+  shell_rc = -1
+  shell_termsig = -1
+  shell_stopsig = -1
+  time_out = 0
+  Call Syscall_Cmd "pipe pp."
+  fd.1 = pp.2
+  If not_do_wait Then Call Syscall_Cmd "f_setfl (pp.1) (o_nonblock)"
+  Call Syscall_Cmd "dup (fd.1)"
+  fd.2 = retval
+  Call Syscall_Cmd "spawnp (parm.1) 3 fd. parm. __environment."
+  pid = retval
+  all_output = ""
+  If do_wait Then Do
+    Call Syscall_Cmd "alarm" timeout_value /* timeout setting in secs */
+    Call Syscall_Cmd "waitpid (pid) stat. 0", info_on_timeout
+  End
+  Else Do
+    time_beg = Time("E")
+    Do Forever
+      Call Syscall_Cmd "waitpid (pid) stat. (w_nohang)"
+      If timeout_value<>0 & Time("E")-time_beg>=timeout_value Then Do
+        time_out = 1
+        Leave
+      End
+      If stat.w_ifexited Then Leave
+      Call Get_Output_Data
+      Call Syscall_Cmd "sigpending sigset"
+      If Substr(sigset,sigterm,1)=1 | Substr(sigset,sigalrm,1)=1 Then Do
+        time_out = 1
+        Leave
+      End
+      Call Syscall_Cmd "sleep 1"
+    End
+  End
+  Call Syscall_Cmd "alarm 0"
+  If time_out Then Do
+    Call Syscall_Cmd "kill (pid)" sigkill, noexit_on_error
+    Call Syscall_Cmd "waitpid (pid) stat. 0"
+  End
+  Select
+    When stat.w_ifexited Then shell_rc = stat.w_exitstatus
+    When stat.w_ifsignaled Then shell_termsig = stat.w_termsig
+    When stat.w_ifstopped Then shell_stopsig = stat.w_stopsig
+    Otherwise Nop
+  End
+  Do j=1 To 2
+    If fd.j<>-1 Then Call Syscall_Cmd "close (fd.j)"
+    fd.j = -1
+  End
+  Call Get_Output_Data
+  Call Syscall_Cmd "close (pp.1)"
+  pp.1 = -1
+  If time_out Then Do
+    Say "CPPAX017I Signal SIGALRM or SIGTERM received or timeout",
+      "occurred, terminating..."
+    Say "CPPAX018I Command:" shell_cmd
+    If background Then Call Final_Exit 8
+  End
+Return
+
+Get_Output_Data: Trace O
+  Do Until retval<1000
+    output_data = ""
+    Call Syscall_Cmd "read (pp.1) output_data 1000"
+    all_output = all_output||output_data
+  End
+  Do While Length(all_output)>0 & Pos(esc_n,all_output)>0
+    Parse Var all_output output_line (esc_n) all_output
+    If Symbol("fd_files")="VAR" Then Do
+      fd_files = fd_files+1
+      fdfile.fd_files = output_line
+    End
+    Else Say output_line
+  End
+Return
+
+Syscall_Cmd: Trace O
+  Parse Arg syscall_cmd, call_type, no_display
+  display_msgs = (no_display<>"1")
+  exit_on_error = (call_type="")
+  Address SYSCALL syscall_cmd
+  If rc=0 & retval=-1 & errno=70 & errnojr="59D0135" Then Do
+    not_OK = 0
+    retval = 0
+  End
+  Else not_OK = (rc<>0 | retval<0 | retval=0 & (errno<>0 | errnojr<>0))
+  OK = (not_OK = 0)
+  If not_OK & display_msgs Then Do
+    If call_type=info_on_timeout & errno=78 Then Do
+      time_out = 1
+      final_rc = 8
+    End
+    Else Do
+      Say "SYSCALL Service:" syscall_cmd
+      Say "Syscall Return Code=" rc
+      Say "OMVS Return Value  =" retval
+      Say "OMVS Return Code   =" errno
+      Say "OMVS Reason Code   =" errnojr
+      is_omvs_range = X2d(Left(Right(errnojr,8,"0"),4))<=X2d(20FF)
+      errno_save = errno
+      errnojr_save = errnojr
+      If errno<>"A3" & errno<>"A4" & is_omvs_range Then
+        show_reason = 1
+      Else
+        show_reason = 0
+      Address SYSCALL "strerror" errno errnojr "err."
+      If rc=0 & retval>=0 Then Do
+        If err.se_errno<>"" Then
+          Say "OMVS Return Code Explanation -" err.se_errno
+        If show_reason & err.se_reason<>"" Then
+          Say "OMVS Reason Code Explanation -" err.se_reason
+      End
+      errno = errno_save
+      errnojr = errnojr_save
+      If exit_on_error Then Call Final_Exit 8
+    End
+  End
+Return
+
